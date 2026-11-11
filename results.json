@@ -1,0 +1,13 @@
+{
+ "test_images": 200,
+ "train_images": 200,
+ "psnr_db": {
+  "bicubic": 28.56,
+  "lanczos": 28.809,
+  "one filter": 29.085,
+  "sorted": 29.45,
+  "sorted+lock": 29.45
+ },
+ "beats_lanczos_frac": 0.995,
+ "numbers": 21600
+}

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SihtiSR</title>
+<style>
+  :root { --bg:#0e1013; --fg:#e8e6df; --dim:#8b8f98; --line:#262a31; --acc:#e0b060; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 ui-monospace,Menlo,Consolas,monospace; padding:20px 16px 60px }
+  h1 { font-size:20px; margin:0 0 4px; letter-spacing:.04em }
+  p { color:var(--dim); margin:0 0 14px; max-width:78ch }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 }
+  button, label.btn { background:#171a20; color:var(--fg); border:1px solid var(--line); padding:7px 12px; font:inherit; cursor:pointer; border-radius:4px }
+  button:hover, label.btn:hover { border-color:var(--acc) }
+  button.on { border-color:var(--acc); color:var(--acc) }
+  input[type=file] { display:none }
+  #stat { color:var(--acc); min-height:1.5em }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px }
+  figure { margin:0; border:1px solid var(--line); border-radius:4px; overflow:hidden; background:#000 }
+  figcaption { padding:6px 10px; color:var(--dim); border-top:1px solid var(--line); background:#12151a }
+  canvas { display:block; width:100%; height:auto; image-rendering:pixelated }
+  video { display:none }
+</style>
+</head>
+<body>
+<h1>SihtiSR — put the residue back</h1>
+<p>Each 5×5 patch is sorted by a hand-written rule (edge angle, strength, coherence) into one of 216 buckets.
+Each bucket holds one small linear map, solved in closed form. 21,600 numbers, no backprop. Runs here, in your browser.</p>
+
+<div class="bar">
+  <label class="btn">Open image<input id="file" type="file" accept="image/*"></label>
+  <button id="cam">Webcam</button>
+  <button id="snap" hidden>Take frame</button>
+  <span style="color:var(--dim)">mode:</span>
+  <button id="mTest" class="on" title="Shrink your image to half, rebuild it, compare against the original">test (shrink, rebuild)</button>
+  <button id="mUp" title="Use your image as it is and double it">upscale ×2</button>
+  <button id="mUp4">upscale ×4</button>
+  <button id="save">Save result</button>
+</div>
+<div id="stat">Open an image or use the webcam.</div>
+
+<div class="grid">
+  <figure><canvas id="cB"></canvas><figcaption>bicubic (the core)</figcaption></figure>
+  <figure><canvas id="cR"></canvas><figcaption>predicted residue (×6, grey = zero)</figcaption></figure>
+  <figure><canvas id="cS"></canvas><figcaption>SihtiSR = bicubic + residue</figcaption></figure>
+</div>
+<video id="vid" playsinline muted></video>
+
+<script src="model.js"></script>
+<script src="sihti.js"></script>
+<script>
+const $ = id => document.getElementById(id), M = window.SIHTI_MODEL;
+let src = null, mode = 'test';
+const MAXIN = { test: 1024, up: 640, up4: 360 };
+
+function planes(img, w, h) {                       // -> {r,g,b,y} Float32 0..1
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(img, 0, 0, w, h);
+  const d = x.getImageData(0, 0, w, h).data, n = w * h;
+  const r = new Float32Array(n), g = new Float32Array(n), b = new Float32Array(n), y = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    r[i] = d[4 * i] / 255; g[i] = d[4 * i + 1] / 255; b[i] = d[4 * i + 2] / 255;
+    y[i] = 0.299 * r[i] + 0.587 * g[i] + 0.114 * b[i];
+  }
+  return { r, g, b, y };
+}
+function half(a, w, h) {                           // 2x2 mean
+  const W = w >> 1, H = h >> 1, o = new Float32Array(W * H);
+  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+    const p = 2 * j * w + 2 * i; o[j * W + i] = (a[p] + a[p + 1] + a[p + w] + a[p + w + 1]) / 4;
+  }
+  return o;
+}
+function step(p, w, h) {                           // one x2: returns bicubic RGB, residue, SR RGB
+  const ys = Sihti.sihtiUp(p.y, h, w, M), yb = Sihti.bicubicUp(p.y, h, w);
+  const res = new Float32Array(ys.length);
+  for (let i = 0; i < res.length; i++) res[i] = ys[i] - yb[i];
+  const bic = {}, sr = { y: ys };
+  for (const k of 'rgb') {
+    bic[k] = Sihti.bicubicUp(p[k], h, w);
+    sr[k] = new Float32Array(res.length);
+    for (let i = 0; i < res.length; i++) sr[k][i] = Math.min(1, Math.max(0, bic[k][i] + res[i]));
+  }
+  for (let i = 0; i < ys.length; i++) ys[i] = Math.min(1, Math.max(0, ys[i]));
+  bic.y = yb;
+  return { bic, res, sr };
+}
+function draw(cv, w, h, f) {
+  cv.width = w; cv.height = h;
+  const x = cv.getContext('2d'), im = x.createImageData(w, h), d = im.data;
+  for (let i = 0; i < w * h; i++) { const c = f(i); d[4 * i] = c[0] * 255; d[4 * i + 1] = c[1] * 255; d[4 * i + 2] = c[2] * 255; d[4 * i + 3] = 255; }
+  x.putImageData(im, 0, 0);
+}
+function psnr(a, b, w, h) {
+  let s = 0, n = 0;
+  for (let y = 4; y < h - 4; y++) for (let x = 4; x < w - 4; x++) { const e = Math.min(1, Math.max(0, a[y * w + x])) - b[y * w + x]; s += e * e; n++; }
+  return -10 * Math.log10(s / n);
+}
+function run() {
+  if (!src) return;
+  const sw = src.videoWidth || src.naturalWidth || src.width, sh = src.videoHeight || src.naturalHeight || src.height;
+  const k = Math.min(1, MAXIN[mode] / Math.max(sw, sh));
+  let w = Math.round(sw * k), h = Math.round(sh * k);
+  const t0 = performance.now();
+  let msg, out, W, H;
+  if (mode === 'test') {
+    w -= w % 2; h -= h % 2;
+    const full = planes(src, w, h), lo = {};
+    for (const c of 'rgby') lo[c] = half(full[c], w, h);
+    out = step(lo, w >> 1, h >> 1); W = w; H = h;
+    const pb = psnr(out.bic.y, full.y, W, H), ps = psnr(out.sr.y, full.y, W, H);
+    msg = `rebuilt ${w >> 1}×${h >> 1} → ${W}×${H} · bicubic ${pb.toFixed(2)} dB · SihtiSR ${ps.toFixed(2)} dB · gain ${(ps - pb >= 0 ? '+' : '') + (ps - pb).toFixed(2)} dB against your original`;
+  } else {
+    let p = planes(src, w, h); W = w; H = h;
+    const n = mode === 'up4' ? 2 : 1;
+    for (let i = 0; i < n; i++) {
+      out = step(p, W, H); W *= 2; H *= 2;
+      if (i < n - 1) p = out.sr;
+    }
+    msg = `${w}×${h} → ${W}×${H} · no original to compare with, so the added detail is a prediction`;
+  }
+  draw($('cB'), W, H, i => [out.bic.r[i], out.bic.g[i], out.bic.b[i]].map(v => Math.min(1, Math.max(0, v))));
+  draw($('cR'), W, H, i => { const v = Math.min(1, Math.max(0, 0.5 + 6 * out.res[i])); return [v, v, v]; });
+  draw($('cS'), W, H, i => [out.sr.r[i], out.sr.g[i], out.sr.b[i]]);
+  $('stat').textContent = msg + ` · ${Math.round(performance.now() - t0)} ms`;
+}
+function setMode(m) { mode = m; for (const [id, v] of [['mTest', 'test'], ['mUp', 'up'], ['mUp4', 'up4']]) $(id).classList.toggle('on', v === m); run(); }
+$('mTest').onclick = () => setMode('test'); $('mUp').onclick = () => setMode('up'); $('mUp4').onclick = () => setMode('up4');
+$('file').onchange = e => { const f = e.target.files[0]; if (!f) return; const im = new Image(); im.onload = () => { src = im; run(); }; im.src = URL.createObjectURL(f); };
+$('cam').onclick = async () => {
+  try {
+    const v = $('vid'); v.srcObject = await navigator.mediaDevices.getUserMedia({ video: true }); await v.play();
+    $('snap').hidden = false; $('stat').textContent = 'Webcam on. Press "Take frame".';
+  } catch (e) { $('stat').textContent = 'Webcam not available: ' + e.message; }
+};
+$('snap').onclick = () => { const v = $('vid'), c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight; c.getContext('2d').drawImage(v, 0, 0); src = c; run(); };
+$('save').onclick = () => { const a = document.createElement('a'); a.download = 'sihtisr.png'; a.href = $('cS').toDataURL('image/png'); a.click(); };
+</script>
+</body>
+</html>
